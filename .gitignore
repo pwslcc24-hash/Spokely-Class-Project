@@ -1,0 +1,11 @@
+.DS_Store
+pycache/
+*.pyc
+.venv/
+venv/
+.env
+node_modules/
+dist/
+build/
+.cursor/
+.vscode/
