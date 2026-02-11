@@ -6,5 +6,13 @@
     "status": "finished",
     "total": 100.0,
     "notification_sent": true
+  },
+  {
+    "id": 2,
+    "customer": "Test 2",
+    "item": "Bike 2",
+    "status": "finished",
+    "total": 2000.0,
+    "notification_sent": true
   }
 ]
