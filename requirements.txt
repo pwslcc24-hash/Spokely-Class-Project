@@ -1,1 +1,2 @@
 # No external dependencies — uses only Python standard library (json, os)
+flask>=3.0.0
