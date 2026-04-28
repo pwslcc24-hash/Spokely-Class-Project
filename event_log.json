@@ -1,14 +1,10 @@
-[
-  {
-    "timestamp": "2026-02-25T05:31:44Z",
-    "workorder_id": 2,
-    "event_type": "sms_simulated",
-    "message": "SMS would be sent to Test 2 for work order #2 (Bike 2)"
-  },
-  {
-    "timestamp": "2026-02-25T05:37:10Z",
-    "workorder_id": 1,
-    "event_type": "sms_simulated",
-    "message": "SMS would be sent to Test for work order #1 (Bike)"
-  }
-]
+{
+  "pwslcc24@gmail.com": [
+    {
+      "timestamp": "2026-03-04T06:05:09Z",
+      "workorder_id": 2,
+      "event_type": "sms_simulated",
+      "message": "SMS would be sent to Test 1 for work order #2 (Bike 1)"
+    }
+  ]
+}

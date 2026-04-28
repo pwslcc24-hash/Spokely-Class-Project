@@ -1,0 +1,10 @@
+[
+  {
+    "email": "porterwhitworth@gmail.com",
+    "password_hash": "scrypt:32768:8:1$PvBc8n7MTcVVH02C$f67fe38c23a3c0347f0857fa33f121a8b86939fdf88813fa75c1ce52d47f8fab82480fd305491c06dfc1123a8d1f1900e4b2e1c4fd36748c6ec1d0a5693f7867"
+  },
+  {
+    "email": "pwslcc24@gmail.com",
+    "password_hash": "scrypt:32768:8:1$2zmALqhPVnHpbUD5$318ba635c09d8d7d2e48dda973861beac7443a837718b8ba6d9d435fdac64df1bb3151c083fbe5d9851fb8d9613de1741c2428ff703136be758fa48577d78508"
+  }
+]
