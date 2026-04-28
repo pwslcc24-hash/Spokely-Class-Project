@@ -2,28 +2,41 @@
   "pwslcc24@gmail.com": [
     {
       "id": 2,
-      "customer": "Test 1",
+      "owner_email": "pwslcc24@gmail.com",
+      "customer": "Porter",
       "item": "Bike 1",
       "status": "Finished",
-      "total": 3000.0,
+      "total": 1000.0,
       "notification_sent": true
+    },
+    {
+      "id": 4,
+      "owner_email": "pwslcc24@gmail.com",
+      "customer": "Porter 2",
+      "item": "Bike 2",
+      "status": "in progress",
+      "total": 2000.0,
+      "notification_sent": false
     }
   ],
   "porterwhitworth@gmail.com": [
     {
-      "id": 1,
+      "id": 5,
+      "owner_email": "porterwhitworth@gmail.com",
       "customer": "Sample Customer",
       "item": "Sample repair",
       "status": "in progress",
       "total": 0.0,
       "notification_sent": false
-    },
+    }
+  ],
+  "pwhitworthxc@gmail.com": [
     {
-      "id": 2,
-      "customer": "Test 2",
-      "item": "Bike 2",
+      "id": 3,
+      "customer": "Sample Customer",
+      "item": "Sample repair",
       "status": "in progress",
-      "total": 1000.0,
+      "total": 0.0,
       "notification_sent": false
     }
   ]

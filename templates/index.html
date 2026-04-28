@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spokely Work Orders — Dashboard</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;}
+    body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#f5f5f5;color:#222;}
+    .app{max-width:900px;margin:0 auto;padding:24px;}
+    header{background:#1a1a2e;color:#eee;padding:16px 20px;margin:-24px -24px 24px -24px;border-radius:0 0 8px 8px;}
+    header h1{margin:0;font-size:1.5rem;font-weight:600;}
+    header .header-links{margin:8px 0 0 0;}
+    header .header-links a{color:#8ab4f8;}
+    header .header-links a:hover{text-decoration:underline;}
+    .banner{background:#e7f3ff;border:1px solid #0066cc;border-radius:6px;padding:12px 16px;margin-bottom:20px;}
+    .banner strong{color:#004080;}
+    h2{font-size:1.1rem;color:#333;margin:0 0 12px 0;}
+    table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);}
+    th,td{padding:12px 16px;text-align:left;border-bottom:1px solid #eee;}
+    th{background:#f8f9fa;font-weight:600;color:#444;}
+    tr:last-child td{border-bottom:0;}
+    .badge{padding:4px 10px;border-radius:20px;font-size:0.85rem;font-weight:500;}
+    .badge.inprogress{background:#fff3cd;color:#856404;}
+    .badge.finished{background:#d4edda;color:#155724;}
+    .btn{padding:8px 14px;border-radius:6px;border:none;cursor:pointer;font-size:0.9rem;text-decoration:none;display:inline-block;}
+    .btn-primary{background:#1a1a2e;color:#fff;}
+    .btn-primary:hover{background:#2d2d44;}
+    .btn-sm{padding:6px 10px;font-size:0.85rem;}
+    .btn-danger{background:#dc3545;color:#fff;}
+    .btn-danger:hover{background:#c82333;}
+    .action-cell form{display:inline;margin-right:6px;}
+    .action-cell .btn-link{background:#0d6efd;color:#fff;}
+    .action-cell .btn-link:hover{background:#0b5ed7;}
+    .card{background:#fff;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.08);}
+    .form-row{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:8px;}
+    .form-group{min-width:120px;}
+    .form-group label{display:block;font-size:0.85rem;color:#555;margin-bottom:4px;}
+    .form-group input,.form-group select{width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:6px;}
+    .event-log{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;max-height:280px;overflow-y:auto;}
+    .event-log ul{margin:0;padding-left:20px;}
+    .event-log li{margin:4px 0;font-size:0.9rem;color:#444;}
+    .event-log .meta{color:#666;font-size:0.8rem;}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Spokely Work Orders</h1>
+      <p class="header-links">
+        <span>Welcome, {{ user_email }}</span> &middot;
+        <a href="{{ url_for('add_workorder') }}">Add Work Order (form)</a> &middot;
+        <a href="{{ url_for('logout') }}">Log out</a>
+      </p>
+    </header>
+
+    {% if notified %}
+    <div class="banner">
+      <strong>Notification:</strong>
+      {% for wid, customer, item in notified %}
+        Work order #{{ wid }} ({{ customer }} – {{ item }}) marked finished; SMS simulated.
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <h2>Add Work Order</h2>
+      <form method="post" action="{{ url_for('index') }}">
+        <input type="hidden" name="action" value="add">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Customer</label>
+            <input type="text" name="customer" required>
+          </div>
+          <div class="form-group">
+            <label>Item</label>
+            <input type="text" name="item" required>
+          </div>
+          <div class="form-group">
+            <label>Total ($)</label>
+            <input type="number" name="total" step="0.01" value="0">
+          </div>
+          <div class="form-group">
+            <label>Status</label>
+            <select name="status">
+              <option value="in progress" selected>in progress</option>
+              <option value="Finished">Finished</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Add Work Order</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Your work orders</h2>
+      <p style="color:#555;font-size:0.9rem;margin:-4px 0 12px 0;">Signed in as <strong>{{ user_email }}</strong>. Only your work orders are shown and can be edited.</p>
+      {% if work_orders %}
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Customer</th><th>Item</th><th>Status</th><th>Total</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          {% for wo in work_orders %}
+          {% set is_finished = (wo.status or '')|lower in ['finished', 'complete', 'completed'] %}
+          {% set total_str = "$%.2f"|format(wo.total|default(0)|float) %}
+          <tr>
+            <td>{{ wo.id }}</td>
+            <td>{{ wo.customer }}</td>
+            <td>{{ wo.item }}</td>
+            <td>
+              <span class="badge {{ 'finished' if is_finished else 'inprogress' }}">
+                {{ 'Finished' if is_finished else 'In progress' }}
+              </span>
+            </td>
+            <td>{{ total_str }}</td>
+            <td class="action-cell">
+              <a href="{{ url_for('edit_workorder', item_id=wo.id) }}" class="btn btn-sm btn-link">Edit</a>
+              {% if not is_finished %}
+              <form method="post" action="{{ url_for('index') }}">
+                <input type="hidden" name="action" value="mark_finished">
+                <input type="hidden" name="workorder_id" value="{{ wo.id }}">
+                <button type="submit" class="btn btn-primary btn-sm">Mark Finished</button>
+              </form>
+              {% endif %}
+              <form method="post" action="{{ url_for('delete_workorder', item_id=wo.id) }}" onsubmit="return confirm('Delete this work order?');">
+                <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p>No work orders yet. Add one above.</p>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Event log (last 10)</h2>
+      <div class="event-log">
+        {% if recent_events %}
+        <ul>
+          {% for e in recent_events %}
+          <li><span class="meta">{{ e.timestamp }}</span> WO #{{ e.workorder_id }} {{ e.event_type }}: {{ e.message }}</li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p>No events yet.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</body>
+</html>

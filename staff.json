@@ -6,5 +6,9 @@
   {
     "email": "pwslcc24@gmail.com",
     "password_hash": "scrypt:32768:8:1$2zmALqhPVnHpbUD5$318ba635c09d8d7d2e48dda973861beac7443a837718b8ba6d9d435fdac64df1bb3151c083fbe5d9851fb8d9613de1741c2428ff703136be758fa48577d78508"
+  },
+  {
+    "email": "pwhitworthxc@gmail.com",
+    "password_hash": "scrypt:32768:8:1$NMDx4S0MpqCURAtO$9b8ce6122b61c95f0aa81eda0ee14ee9384ace796291e9f9d698f6cdb2cf8bf23d0c29bc5e9a7c70c5e9b22ba5955d99bfe71ceb74d831279c6092363daa20d4"
   }
 ]

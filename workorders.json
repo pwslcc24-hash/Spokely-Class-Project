@@ -26,5 +26,25 @@
       "total": 1000.0,
       "notification_sent": false
     }
+  ],
+  "pwhitworthxc@gmail.com": [
+    {
+      "id": 2,
+      "customer": "steve",
+      "item": "bike",
+      "status": "in progress",
+      "total": 3000.0,
+      "notification_sent": false
+    }
+  ],
+  "__guest__": [
+    {
+      "id": 1,
+      "customer": "bjedb",
+      "item": "en je f",
+      "status": "in progress",
+      "total": 123.0,
+      "notification_sent": false
+    }
   ]
 }

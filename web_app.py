@@ -1,165 +1,372 @@
 """
-Spokely Work Order Tracking — Web Prototype (production-shaped)
-Single route / returns HTML: work orders, event log (last 10), and optional SMS banner.
+Spokely Work Order Tracking — multi-user app with SQLite, sessions, and hashed passwords.
 """
 
 import json
 import os
+import re
 from datetime import datetime
-from flask import Flask, request, redirect, url_for, render_template, session
+
+from dotenv import load_dotenv
+from flask import Flask, request, redirect, url_for, render_template, session, abort, g
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
+from models import db, User, WorkOrder
+from routes.api_routes import api_v1_bp
+
+basedir = os.path.abspath(os.path.dirname(__file__))
+load_dotenv(os.path.join(basedir, ".env"))
+
+
+def _database_uri():
+    """SQLAlchemy DB URI from DATABASE_URL, or local SQLite in the project directory."""
+    uri = (os.environ.get("DATABASE_URL") or "").strip()
+    if uri:
+        return uri
+    return "sqlite:///" + os.path.join(basedir, "project.db")
+
+
+def _secret_key():
+    key = (os.environ.get("SECRET_KEY") or "").strip()
+    if not key:
+        raise RuntimeError(
+            "SECRET_KEY is not set. Copy .env.example to .env and set SECRET_KEY, "
+            "or export SECRET_KEY in the environment."
+        )
+    return key
+
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "spokely-dev-secret-change-in-production")
-DATA_FILE = "workorders.json"
+app.secret_key = _secret_key()
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = _database_uri()
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db.init_app(app)
+app.register_blueprint(api_v1_bp)
+
 SNAPSHOT_FILE = "last_snapshot.json"
 EVENT_LOG_FILE = "event_log.json"
-STAFF_FILE = "staff.json"
+STAFF_FILE = "staff.json"  # legacy: one-time import into users table if empty
+
+MIN_PASSWORD_LENGTH = 8
+MAX_FIELD_LEN = {"customer": 255, "item": 512, "status": 64}
 
 
 # -----------------------------------------------------------------------------
-# Data adapter: work orders per user (JSON now; Lightspeed API later)
+# Input validation
 # -----------------------------------------------------------------------------
 
 def _norm_email(email):
-    """Normalize email for storage key (lowercase)."""
     return (email or "").strip().lower()
 
 
-def _load_workorders_raw():
-    """Load full workorders file. Returns dict keyed by user email. Legacy list format → empty dict."""
-    if not os.path.exists(DATA_FILE):
-        return {}
-    try:
-        with open(DATA_FILE, "r") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return {}
-        return data
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_workorders_raw(data):
-    """Save full workorders file (dict keyed by user email)."""
-    try:
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except OSError:
-        pass
-
-
-SAMPLE_WORK_ORDER = [
-    {
-        "id": 1,
-        "customer": "Sample Customer",
-        "item": "Sample repair",
-        "status": "in progress",
-        "total": 0.0,
-        "notification_sent": False,
-    }
-]
-
-
-def get_workorders(source="json", user_email=None):
-    """Load work orders for the given user. If user has none, return one sample and save it.
-    TODO: replace with Lightspeed API later — normalize to same list-of-dict shape.
-    """
-    if source != "json" or not user_email:
-        return []
-    key = _norm_email(user_email)
-    data = _load_workorders_raw()
-    work_orders = data.get(key)
-    if not work_orders or not isinstance(work_orders, list):
-        work_orders = list(SAMPLE_WORK_ORDER)
-        data[key] = work_orders
-        _save_workorders_raw(data)
-    return work_orders
-
-
-def save_workorders(work_orders, user_email):
-    """Persist this user's work orders to workorders.json."""
-    if not user_email:
-        return
-    key = _norm_email(user_email)
-    data = _load_workorders_raw()
-    data[key] = work_orders
-    _save_workorders_raw(data)
-
-
-# -----------------------------------------------------------------------------
-# Staff login: store and retrieve staff (email + password hash)
-# -----------------------------------------------------------------------------
-
-def _load_staff():
-    """Load staff list from staff.json."""
-    if os.path.exists(STAFF_FILE):
-        try:
-            with open(STAFF_FILE, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return []
-
-
-def _save_staff(staff_list):
-    """Save staff list to staff.json."""
-    try:
-        with open(STAFF_FILE, "w") as f:
-            json.dump(staff_list, f, indent=2)
-    except OSError:
-        pass
-
-
-def _find_staff_by_email(email):
-    """Return staff dict for email or None. Email comparison is case-insensitive."""
-    email = (email or "").strip().lower()
-    if not email:
-        return None
-    for s in _load_staff():
-        if (s.get("email") or "").strip().lower() == email:
-            return s
+def validate_email_format(email):
+    """Basic RFC-like check for login/register."""
+    if not email or len(email) > 255:
+        return "Enter a valid email address."
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return "Enter a valid email address."
     return None
 
 
-def register_staff(email, password):
-    """Register a new staff member. Returns True if created, False if email already exists."""
-    email = (email or "").strip().lower()
-    if not email or not password:
+def validate_password_new(password):
+    """Registration password rules."""
+    if not password:
+        return "Password is required."
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if len(password) > 128:
+        return "Password is too long."
+    return None
+
+
+def _safe_user_id(uid):
+    """Normalize session / form user ids to int (Flask session JSON may use str)."""
+    if uid is None:
+        return None
+    try:
+        i = int(uid)
+        return i if i > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_work_order_fields(customer, item, status):
+    """Sanitize length for work order text fields."""
+    customer = (customer or "").strip()
+    item = (item or "").strip()
+    status = (status or "in progress").strip() or "in progress"
+    if not customer or not item:
+        return None, None, None, "Customer and item are required."
+    if len(customer) > MAX_FIELD_LEN["customer"] or len(item) > MAX_FIELD_LEN["item"]:
+        return None, None, None, "Input too long."
+    if len(status) > MAX_FIELD_LEN["status"]:
+        status = status[: MAX_FIELD_LEN["status"]]
+    return customer, item, status, None
+
+
+# -----------------------------------------------------------------------------
+# Schema migration (legacy owner_email / staff.json)
+# -----------------------------------------------------------------------------
+
+def _ensure_schema_and_migrate():
+    """Create tables; migrate legacy staff.json and work_orders.owner_email → user_id."""
+    db.create_all()
+    insp = inspect(db.engine)
+    tables = insp.get_table_names()
+
+    if "users" not in tables:
+        db.create_all()
+
+    # Import legacy staff.json into users if DB has no users
+    if User.query.count() == 0 and os.path.exists(STAFF_FILE):
+        try:
+            with open(STAFF_FILE, "r", encoding="utf-8") as f:
+                staff = json.load(f)
+            for s in staff:
+                em = _norm_email(s.get("email"))
+                ph = s.get("password_hash")
+                if em and ph and not User.query.filter_by(email=em).first():
+                    db.session.add(User(email=em, password_hash=ph))
+            db.session.commit()
+        except (json.JSONDecodeError, OSError, Exception):
+            db.session.rollback()
+
+    if "work_orders" not in tables:
+        return
+
+    cols = {c["name"] for c in insp.get_columns("work_orders")}
+    if "owner_email" in cols and "user_id" not in cols:
+        try:
+            db.session.execute(text("ALTER TABLE work_orders ADD COLUMN user_id INTEGER REFERENCES users(id)"))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            cols = {c["name"] for c in inspect(db.engine).get_columns("work_orders")}
+            if "user_id" not in cols:
+                return
+        rows = db.session.execute(text("SELECT id, owner_email FROM work_orders")).fetchall()
+        for rid, oem in rows:
+            u = User.query.filter_by(email=_norm_email(oem)).first()
+            if u:
+                db.session.execute(
+                    text("UPDATE work_orders SET user_id = :uid WHERE id = :rid"),
+                    {"uid": u.id, "rid": rid},
+                )
+        db.session.commit()
+    elif "user_id" in cols and "owner_email" in cols:
+        rows = db.session.execute(
+            text("SELECT id, owner_email FROM work_orders WHERE user_id IS NULL")
+        ).fetchall()
+        for rid, oem in rows:
+            u = User.query.filter_by(email=_norm_email(oem)).first()
+            if u:
+                db.session.execute(
+                    text("UPDATE work_orders SET user_id = :uid WHERE id = :rid"),
+                    {"uid": u.id, "rid": rid},
+                )
+        db.session.commit()
+
+
+# -----------------------------------------------------------------------------
+# Data layer: work orders scoped by user_id (FK to User)
+# -----------------------------------------------------------------------------
+
+def get_workorders(user_id):
+    """Load work orders for the logged-in user."""
+    user_id = _safe_user_id(user_id)
+    if not user_id:
+        return []
+    rows = WorkOrder.query.filter_by(user_id=user_id).order_by(WorkOrder.id).all()
+    if not rows:
+        owner = db.session.get(User, user_id)
+        if owner is None:
+            return []
+        sample = WorkOrder(
+            user_id=user_id,
+            owner_email=owner.email,
+            customer="Sample Customer",
+            item="Sample repair",
+            status="in progress",
+            total=0.0,
+            notification_sent=False,
+        )
+        db.session.add(sample)
+        db.session.commit()
+        rows = WorkOrder.query.filter_by(user_id=user_id).order_by(WorkOrder.id).all()
+    return [r.to_dict() for r in rows]
+
+
+def add_work_order_db(user_id, customer, item, status, total, explicit_id=None):
+    """Insert work order; requires a valid user_id that exists in users (FK)."""
+    user_id = _safe_user_id(user_id)
+    owner = db.session.get(User, user_id) if user_id else None
+    if not user_id or owner is None:
+        return
+    kwargs = {
+        "user_id": user_id,
+        "owner_email": owner.email,
+        "customer": customer,
+        "item": item,
+        "status": status or "in progress",
+        "total": float(total or 0),
+        "notification_sent": False,
+    }
+    if explicit_id is not None and explicit_id > 0 and db.session.get(WorkOrder, explicit_id) is None:
+        kwargs["id"] = explicit_id
+    wo = WorkOrder(**kwargs)
+    db.session.add(wo)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+
+
+def mark_work_order_finished_db(user_id, workorder_id):
+    user_id = _safe_user_id(user_id)
+    if not user_id:
+        return
+    wo = WorkOrder.query.filter_by(id=workorder_id, user_id=user_id).first()
+    if wo:
+        wo.status = "Finished"
+        wo.notification_sent = True
+        db.session.commit()
+
+
+def delete_work_order_db(user_id, workorder_id):
+    user_id = _safe_user_id(user_id)
+    if not user_id:
+        return
+    wo = WorkOrder.query.filter_by(id=workorder_id, user_id=user_id).first()
+    if wo:
+        db.session.delete(wo)
+        db.session.commit()
+
+
+def update_work_order_db(user_id, workorder_id, customer, item, status, total):
+    user_id = _safe_user_id(user_id)
+    if not user_id:
         return False
-    staff_list = _load_staff()
-    if _find_staff_by_email(email):
+    wo = WorkOrder.query.filter_by(id=workorder_id, user_id=user_id).first()
+    if not wo:
         return False
-    staff_list.append({
-        "email": email,
-        "password_hash": generate_password_hash(password),
-    })
-    _save_staff(staff_list)
+    wo.customer = customer
+    wo.item = item
+    wo.status = status or "in progress"
+    wo.total = float(total or 0)
+    st = (wo.status or "").strip().lower()
+    wo.notification_sent = st in ("finished", "complete", "completed")
+    db.session.commit()
     return True
 
 
-def verify_staff(email, password):
-    """Verify email + password. Returns True if valid."""
-    s = _find_staff_by_email(email)
-    if not s or not s.get("password_hash"):
-        return False
-    return check_password_hash(s["password_hash"], password)
+def get_work_order_for_user(user_id, item_id):
+    user_id = _safe_user_id(user_id)
+    if not user_id:
+        return None
+    return WorkOrder.query.filter_by(id=item_id, user_id=user_id).first()
+
+
+# -----------------------------------------------------------------------------
+# Authentication (User table + Flask session)
+# -----------------------------------------------------------------------------
+
+def register_user(email, password):
+    """Create user with hashed password. Returns (True, None) or (False, error_message)."""
+    email = _norm_email(email)
+    err = validate_email_format(email)
+    if err:
+        return False, err
+    err = validate_password_new(password)
+    if err:
+        return False, err
+    if User.query.filter_by(email=email).first():
+        return False, "An account with this email already exists."
+    u = User(email=email, password_hash=generate_password_hash(password))
+    db.session.add(u)
+    db.session.commit()
+    return True, None
+
+
+def verify_user_login(email, password):
+    """Return User if credentials valid, else None."""
+    email = _norm_email(email)
+    if not email or not password:
+        return None
+    u = User.query.filter_by(email=email).first()
+    if not u or not check_password_hash(u.password_hash, password):
+        return None
+    return u
+
+
+def resolve_current_user():
+    """Load User from session; repair stale sessions (missing user_id, or user_id not in DB)."""
+    raw_uid = session.get("user_id")
+    uid = _safe_user_id(raw_uid)
+    if raw_uid is not None and uid is None:
+        session.pop("user_id", None)
+    email = session.get("user")
+    if uid is not None:
+        u = db.session.get(User, uid)
+        if u is not None:
+            if session.get("user_id") != uid:
+                session["user_id"] = uid
+            if email and _norm_email(email) != u.email:
+                session["user"] = u.email
+            return u
+        session.pop("user_id", None)
+    if email:
+        u = User.query.filter_by(email=_norm_email(email)).first()
+        if u is not None:
+            session["user_id"] = int(u.id)
+            session["user"] = u.email
+            return u
+    return None
+
+
+def _current_user_id():
+    """Logged-in user id (after session resolution)."""
+    u = getattr(g, "current_user", None)
+    return u.id if u else None
 
 
 def _current_user_email():
-    """Return logged-in staff email or None."""
-    return session.get("user")
+    u = getattr(g, "current_user", None)
+    return u.email if u else session.get("user")
+
+
+def _set_session_user(user):
+    """Store user id and email in signed session."""
+    session.clear()
+    session["user_id"] = int(user.id)
+    session["user"] = user.email
 
 
 def _require_login():
-    """Redirect to login if not logged in. Return None if logged in, else redirect response."""
-    if _current_user_email():
+    if getattr(g, "current_user", None) is not None:
         return None
+    session.clear()
     return redirect(url_for("login"))
 
 
+@app.before_request
+def _attach_current_user():
+    """Resolve login on every request so FK always matches a real User row."""
+    g.current_user = None
+    if request.endpoint == "static":
+        return
+    g.current_user = resolve_current_user()
+
+
+# -----------------------------------------------------------------------------
+# Snapshot & event log (keyed by normalized email for compatibility)
+# -----------------------------------------------------------------------------
+
 def _load_snapshot_raw():
-    """Load full snapshot file (dict keyed by user email)."""
     if not os.path.exists(SNAPSHOT_FILE):
         return {}
     try:
@@ -171,7 +378,6 @@ def _load_snapshot_raw():
 
 
 def load_snapshot(user_email):
-    """Load previous work order snapshot for this user."""
     if not user_email:
         return []
     key = _norm_email(user_email)
@@ -179,7 +385,6 @@ def load_snapshot(user_email):
 
 
 def save_snapshot(work_orders, user_email):
-    """Persist this user's snapshot for next request."""
     if not user_email:
         return
     key = _norm_email(user_email)
@@ -192,12 +397,7 @@ def save_snapshot(work_orders, user_email):
         pass
 
 
-# -----------------------------------------------------------------------------
-# Event log per user: timestamp, workorder_id, event_type, message
-# -----------------------------------------------------------------------------
-
 def _read_event_log_raw():
-    """Load full event log file (dict keyed by user email)."""
     if not os.path.exists(EVENT_LOG_FILE):
         return {}
     try:
@@ -234,7 +434,6 @@ def append_event(workorder_id, event_type, message, user_email=None):
 
 
 def get_recent_events(limit=10, user_email=None):
-    """Return last `limit` events for this user (newest last for display)."""
     if not user_email:
         return []
     key = _norm_email(user_email)
@@ -243,8 +442,7 @@ def get_recent_events(limit=10, user_email=None):
 
 
 # -----------------------------------------------------------------------------
-# Workflow engine: detect newly finished work orders and “notify” (simulate SMS)
-# TODO: replace simulated SMS with Twilio/real SMS later.
+# Workflow: finished → simulated SMS
 # -----------------------------------------------------------------------------
 
 def _status_finished(status):
@@ -252,9 +450,6 @@ def _status_finished(status):
 
 
 def detect_finished_and_notify(old_list, new_list, user_email=None):
-    """Compare old vs new; for any work order that became finished, log event and simulate SMS.
-    Returns list of (workorder_id, customer, item) that were “notified” this run (for banner).
-    """
     old_by_id = {wo.get("id"): wo for wo in (old_list or [])}
     notified = []
     for wo in new_list or []:
@@ -267,80 +462,72 @@ def detect_finished_and_notify(old_list, new_list, user_email=None):
             item = wo.get("item", "")
             message = f"SMS would be sent to {customer} for work order #{wid} ({item})"
             append_event(wid, "sms_simulated", message, user_email)
-            # Simulate SMS: log/print (replace with Twilio later)
             print(f"[SMS simulated] {message}")
             notified.append((wid, customer, item))
     return notified
 
 
 # -----------------------------------------------------------------------------
-# Routes: / (dashboard), /add_workorder (submission form)
+# Routes
 # -----------------------------------------------------------------------------
-
-def _next_id(work_orders):
-    """Next work order id."""
-    return max((wo.get("id", 0) for wo in work_orders), default=0) + 1
-
-
-def _escape(s):
-    """Escape for HTML text content."""
-    if s is None:
-        return ""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """Staff login: GET shows form; POST verifies email/password and redirects to dashboard."""
     if request.method == "POST":
         email = (request.form.get("email") or "").strip()
         password = request.form.get("password") or ""
-        if email and verify_staff(email, password):
-            session["user"] = email
+        if not email:
+            return render_template("login.html", error="Email is required.")
+        err = validate_email_format(_norm_email(email))
+        if err:
+            return render_template("login.html", error=err)
+        u = verify_user_login(email, password)
+        if u:
+            _set_session_user(u)
             return redirect(url_for("index"))
-        # Invalid login: re-show form with message
         return render_template("login.html", error="Invalid email or password.")
-    if _current_user_email():
+    if _current_user_id() is not None:
         return redirect(url_for("index"))
     return render_template("login.html", error=None)
 
 
 @app.route("/logout")
 def logout():
-    """Clear session and redirect to login."""
     session.clear()
     return redirect(url_for("login"))
 
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    """Create staff account: GET form; POST save to staff.json and redirect to login."""
     if request.method == "POST":
         email = (request.form.get("email") or "").strip()
         password = request.form.get("password") or ""
         confirm = request.form.get("confirm") or ""
-        if not email or not password:
-            return render_template("register.html", error="Email and password are required.")
+        if not email:
+            return render_template("register.html", error="Email is required.")
+        err = validate_email_format(_norm_email(email))
+        if err:
+            return render_template("register.html", error=err)
         if password != confirm:
             return render_template("register.html", error="Passwords do not match.")
-        if _find_staff_by_email(email):
-            return render_template("register.html", error="An account with this email already exists.")
-        register_staff(email, password)
+        ok, msg = register_user(email, password)
+        if not ok:
+            return render_template("register.html", error=msg)
         return redirect(url_for("login"))
-    if _current_user_email():
+    if _current_user_id() is not None:
         return redirect(url_for("index"))
     return render_template("register.html", error=None)
 
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """Dashboard: requires login. POST for add/mark-finished/delete; GET shows this user's work orders and events."""
     redirect_resp = _require_login()
     if redirect_resp is not None:
         return redirect_resp
+    uid = _current_user_id()
     user_email = _current_user_email()
 
-    # --- POST: Add Work Order ---
     if request.method == "POST" and request.form.get("action") == "add":
         customer = (request.form.get("customer") or "").strip()
         item = (request.form.get("item") or "").strip()
@@ -349,69 +536,76 @@ def index():
         except ValueError:
             total = 0
         status = (request.form.get("status") or "in progress").strip() or "in progress"
-        if customer and item:
-            work_orders = get_workorders(source="json", user_email=user_email)
-            new_wo = {
-                "id": _next_id(work_orders),
-                "customer": customer,
-                "item": item,
-                "status": status,
-                "total": total,
-                "notification_sent": False,
-            }
-            work_orders.append(new_wo)
-            save_workorders(work_orders, user_email)
+        c, i, st, verr = validate_work_order_fields(customer, item, status)
+        if verr:
+            pass  # could flash; redirect keeps UX simple
+        elif c and i:
+            add_work_order_db(uid, c, i, st, total)
         return redirect(url_for("index"))
 
-    # --- POST: Mark Finished ---
     if request.method == "POST" and request.form.get("action") == "mark_finished":
         try:
             wid = int(request.form.get("workorder_id"))
         except (TypeError, ValueError):
             wid = None
         if wid is not None:
-            work_orders = get_workorders(source="json", user_email=user_email)
-            for wo in work_orders:
-                if wo.get("id") == wid:
-                    wo["status"] = "Finished"
-                    if "notification_sent" in wo:
-                        wo["notification_sent"] = True
-                    break
-            save_workorders(work_orders, user_email)
+            mark_work_order_finished_db(uid, wid)
         return redirect(url_for("index"))
 
-    # --- POST: Delete Work Order ---
-    if request.method == "POST" and request.form.get("action") == "delete":
-        try:
-            wid = int(request.form.get("workorder_id"))
-        except (TypeError, ValueError):
-            wid = None
-        if wid is not None:
-            work_orders = get_workorders(source="json", user_email=user_email)
-            work_orders[:] = [wo for wo in work_orders if wo.get("id") != wid]
-            save_workorders(work_orders, user_email)
-        return redirect(url_for("index"))
-
-    # --- GET: load this user's data, run workflow, build HTML ---
-    new_list = get_workorders(source="json", user_email=user_email)
+    new_list = get_workorders(uid)
     old_list = load_snapshot(user_email)
     notified = detect_finished_and_notify(old_list, new_list, user_email)
     save_snapshot(new_list, user_email)
     recent_events = get_recent_events(10, user_email)
+    return render_template(
+        "index.html",
+        work_orders=new_list,
+        notified=notified,
+        recent_events=recent_events,
+        user_email=user_email,
+    )
 
-    html = [_build_page(new_list, notified, recent_events, user_email)]
-    return "\n".join(html)
+
+@app.route("/edit/<int:item_id>", methods=["GET", "POST"])
+def edit_workorder(item_id):
+    redirect_resp = _require_login()
+    if redirect_resp is not None:
+        return redirect_resp
+    uid = _current_user_id()
+    wo = get_work_order_for_user(uid, item_id)
+    if not wo:
+        abort(404)
+    if request.method == "POST":
+        customer = (request.form.get("customer") or "").strip()
+        item = (request.form.get("item") or "").strip()
+        status = (request.form.get("status") or "in progress").strip() or "in progress"
+        try:
+            total = float(request.form.get("total") or "0")
+        except ValueError:
+            total = 0.0
+        c, i, st, verr = validate_work_order_fields(customer, item, status)
+        if c and i and not verr:
+            update_work_order_db(uid, item_id, c, i, st, total)
+        return redirect(url_for("index"))
+    return render_template("edit_workorder.html", wo=wo)
+
+
+@app.route("/delete/<int:item_id>", methods=["POST"])
+def delete_workorder(item_id):
+    redirect_resp = _require_login()
+    if redirect_resp is not None:
+        return redirect_resp
+    delete_work_order_db(_current_user_id(), item_id)
+    return redirect(url_for("index"))
 
 
 @app.route("/add_workorder", methods=["GET", "POST"])
 def add_workorder():
-    """Work order submission form: requires login. GET form; POST save and redirect to dashboard."""
     redirect_resp = _require_login()
     if redirect_resp is not None:
         return redirect_resp
-    user_email = _current_user_email()
+    uid = _current_user_id()
     if request.method == "POST":
-        # Extract submitted form data (structured as dictionary for the data model)
         raw_id = request.form.get("id")
         try:
             form_id = int(raw_id) if raw_id and str(raw_id).strip() else None
@@ -424,144 +618,25 @@ def add_workorder():
             total = float(request.form.get("total") or "0")
         except ValueError:
             total = 0.0
-        if not customer or not item:
+        c, i, st, verr = validate_work_order_fields(customer, item, status)
+        if not c or not i or verr:
             return redirect(url_for("add_workorder"))
-        work_orders = get_workorders(source="json", user_email=user_email)
-        # Use form ID only if provided and positive; otherwise assign next available
-        if form_id is not None and form_id > 0 and not any(wo.get("id") == form_id for wo in work_orders):
-            wo_id = form_id
-        else:
-            wo_id = _next_id(work_orders)
-        new_work_order = {
-            "id": wo_id,
-            "customer": customer,
-            "item": item,
-            "status": status,
-            "total": total,
-            "notification_sent": False,
-        }
-        work_orders.append(new_work_order)
-        save_workorders(work_orders, user_email)
+        explicit_id = form_id if form_id is not None and form_id > 0 else None
+        add_work_order_db(uid, c, i, st, total, explicit_id=explicit_id)
         return redirect(url_for("index"))
     return render_template("add_workorder.html")
 
 
-def _build_page(work_orders, notified, recent_events, user_email=None):
-    """Build full HTML page: personalized dashboard with work orders and workflow events."""
-    parts = [
-        "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
-        "<title>Spokely Work Orders</title>",
-        "<style>",
-        "*,*::before,*::after{box-sizing:border-box;}",
-        "body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#f5f5f5;color:#222;}",
-        ".app{max-width:900px;margin:0 auto;padding:24px;}",
-        "header{background:#1a1a2e;color:#eee;padding:16px 20px;margin:-24px -24px 24px -24px;border-radius:0 0 8px 8px;}",
-        "header h1{margin:0;font-size:1.5rem;font-weight:600;}",
-        "header .header-links{margin:8px 0 0 0;}",
-        "header .header-links a{color:#8ab4f8;}",
-        "header .header-links a:hover{text-decoration:underline;}",
-        ".banner{background:#e7f3ff;border:1px solid #0066cc;border-radius:6px;padding:12px 16px;margin-bottom:20px;}",
-        ".banner strong{color:#004080;}",
-        "h2{font-size:1.1rem;color:#333;margin:0 0 12px 0;}",
-        "table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);}",
-        "th,td{padding:12px 16px;text-align:left;border-bottom:1px solid #eee;}",
-        "th{background:#f8f9fa;font-weight:600;color:#444;}",
-        "tr:last-child td{border-bottom:0;}",
-        ".badge{padding:4px 10px;border-radius:20px;font-size:0.85rem;font-weight:500;}",
-        ".badge.inprogress{background:#fff3cd;color:#856404;}",
-        ".badge.finished{background:#d4edda;color:#155724;}",
-        ".btn{padding:8px 14px;border-radius:6px;border:none;cursor:pointer;font-size:0.9rem;}",
-        ".btn-primary{background:#1a1a2e;color:#fff;}",
-        ".btn-primary:hover{background:#2d2d44;}",
-        ".btn-sm{padding:6px 10px;font-size:0.85rem;}",
-        ".btn-danger{background:#dc3545;color:#fff;}",
-        ".btn-danger:hover{background:#c82333;}",
-        ".action-cell form{display:inline;margin-right:6px;}",
-        ".card{background:#fff;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.08);}",
-        ".form-row{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:8px;}",
-        ".form-group{min-width:120px;}",
-        ".form-group label{display:block;font-size:0.85rem;color:#555;margin-bottom:4px;}",
-        ".form-group input,.form-group select{width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:6px;}",
-        ".event-log{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;max-height:280px;overflow-y:auto;}",
-        ".event-log ul{margin:0;padding-left:20px;}",
-        ".event-log li{margin:4px 0;font-size:0.9rem;color:#444;}",
-        ".event-log .meta{color:#666;font-size:0.8rem;}",
-        "</style>",
-        "</head><body><div class='app'>",
-        "<header><h1>Spokely Work Orders</h1>",
-        "<p class='header-links'>",
-    ]
-    if user_email:
-        parts.append(f"<span>Welcome, {_escape(user_email)}</span> &middot; ")
-    parts.append("<a href='/add_workorder'>Add Work Order (form)</a> &middot; <a href='/logout'>Log out</a></p></header>")
-
-    # Notification banner
-    if notified:
-        lines = [f"Work order #{wid} ({_escape(customer)} – {_escape(item)}) marked finished; SMS simulated." for wid, customer, item in notified]
-        parts.append("<div class='banner'><strong>Notification:</strong> " + " ".join(lines) + "</div>")
-
-    # Add Work Order form
-    parts.append("<div class='card'><h2>Add Work Order</h2>")
-    parts.append("<form method='post' action='/'>")
-    parts.append("<input type='hidden' name='action' value='add'>")
-    parts.append("<div class='form-row'>")
-    parts.append("<div class='form-group'><label>Customer</label><input type='text' name='customer' required></div>")
-    parts.append("<div class='form-group'><label>Item</label><input type='text' name='item' required></div>")
-    parts.append("<div class='form-group'><label>Total ($)</label><input type='number' name='total' step='0.01' value='0'></div>")
-    parts.append("<div class='form-group'><label>Status</label><select name='status'><option value='in progress' selected>in progress</option><option value='Finished'>Finished</option></select></div>")
-    parts.append("<div class='form-group'><label>&nbsp;</label><button type='submit' class='btn btn-primary'>Add Work Order</button></div>")
-    parts.append("</div></form></div>")
-
-    # Work orders table
-    parts.append("<div class='card'><h2>Work Orders</h2>")
-    if not work_orders:
-        parts.append("<p>No work orders yet. Add one above.</p>")
-    else:
-        parts.append("<table><thead><tr><th>ID</th><th>Customer</th><th>Item</th><th>Status</th><th>Total</th><th>Action</th></tr></thead><tbody>")
-        for wo in work_orders:
-            total = wo.get("total", 0)
-            total_str = f"${total:.2f}" if isinstance(total, (int, float)) else str(total)
-            status_val = (wo.get("status") or "").strip()
-            is_finished = _status_finished(status_val)
-            badge_class = "finished" if is_finished else "inprogress"
-            badge_text = "Finished" if is_finished else "In progress"
-            wid = wo.get("id")
-            parts.append(
-                f"<tr><td>{wid}</td><td>{_escape(wo.get('customer'))}</td><td>{_escape(wo.get('item'))}</td>"
-                f"<td><span class='badge {badge_class}'>{_escape(badge_text)}</span></td><td>{_escape(total_str)}</td><td class='action-cell'>"
-            )
-            if not is_finished:
-                parts.append(
-                    f"<form method='post' action='/'>"
-                    f"<input type='hidden' name='action' value='mark_finished'><input type='hidden' name='workorder_id' value='{wid}'>"
-                    f"<button type='submit' class='btn btn-primary btn-sm'>Mark Finished</button></form>"
-                )
-            parts.append(
-                f"<form method='post' action='/'>"
-                f"<input type='hidden' name='action' value='delete'><input type='hidden' name='workorder_id' value='{wid}'>"
-                f"<button type='submit' class='btn btn-danger btn-sm'>Delete</button></form>"
-            )
-            parts.append("</td></tr>")
-        parts.append("</tbody></table>")
-    parts.append("</div>")
-
-    # Event log panel
-    parts.append("<div class='card'><h2>Event log (last 10)</h2><div class='event-log'>")
-    if not recent_events:
-        parts.append("<p>No events yet.</p>")
-    else:
-        parts.append("<ul>")
-        for e in recent_events:
-            parts.append(
-                f"<li><span class='meta'>{_escape(e.get('timestamp'))}</span> WO #{e.get('workorder_id')} "
-                f"{_escape(e.get('event_type'))}: {_escape(e.get('message'))}</li>"
-            )
-        parts.append("</ul>")
-    parts.append("</div></div>")
-
-    parts.append("</div></body></html>")
-    return "".join(parts)
+with app.app_context():
+    _ensure_schema_and_migrate()
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    _d = (os.environ.get("FLASK_DEBUG") or "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _host = (os.environ.get("FLASK_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    _port = int((os.environ.get("FLASK_PORT") or "5000").strip() or "5000")
+    app.run(host=_host, port=_port, debug=_d)
